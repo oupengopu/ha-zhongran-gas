@@ -1,0 +1,35 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "中国燃气（中燃在线）",
+        "description": "{howto}\n\n需要的 5 个值：\n• access_token：请求头 accessToken\n• user_id：请求头 userId\n• cust_code：燃气户号（10 位数字）\n• cust_name：户主姓名（全名）\n• mas：请求头 x-mas-app-info 的完整值",
+        "data": {
+          "access_token": "accessToken",
+          "user_id": "userId",
+          "cust_code": "燃气户号 custCode",
+          "cust_name": "户主姓名",
+          "mas": "x-mas-app-info",
+          "scan_interval": "刷新间隔（分钟）"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "连接失败，检查网络或参数",
+      "invalid_auth": "accessToken 失效，请从「中燃在线」小程序重新抓取"
+    },
+    "abort": {
+      "already_configured": "这个户号已经添加过了"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "选项",
+        "data": {
+          "scan_interval": "刷新间隔（分钟）"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "domain": "zhongran_gas",
+  "name": "中国燃气（中燃在线）",
+  "codeowners": ["@oupengopu"],
+  "config_flow": true,
+  "documentation": "https://github.com/oupengopu/ha-zhongran-gas",
+  "issue_tracker": "https://github.com/oupengopu/ha-zhongran-gas/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.1.0"
+}

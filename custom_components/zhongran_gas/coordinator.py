@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,7 @@ STORAGE_VERSION = 1
 SETTLEMENT_HOUR = 8  # 云端通常每天 08:00 左右结算前一天用量
 ZERO_CONFIRM_HOUR = 12  # 到这时余额仍未变化，才判定前一天为真实零用量
 MAX_BACKFILL_DAYS = 120  # 超过这么多天不再均摊回填，直接重建基准
+MAX_OVERPAY_RATIO = 3.0  # 缴费额超过缺口这么多倍就判为错配，不做冲正
 
 
 class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -45,6 +47,9 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._daylist: list[dict[str, Any]] = []
         self._daily: dict[str, Any] = {}  # 当天已结算的日用量缓存
         self._rows: list[dict[str, Any]] = []  # 最近一次成功的月度用气数据
+        # 已经用于缴费冲正的缴费单号：同月多笔缴费时，同一个窗口会反复
+        # 看到同一批记录，不记住就会把同一笔钱重复冲正，算出成倍的用量
+        self._used_pays: list[str] = []
 
         super().__init__(
             hass,
@@ -62,17 +67,21 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             prev = data.get("prev")
             self._prev = prev if isinstance(prev, dict) else {}
             daylist = data.get("daylist")
-            self._daylist = (
-                [r for r in daylist if isinstance(r, dict)]
-                if isinstance(daylist, list)
-                else []
-            )
+            # day 必须是合法日期且 f_gas 是数字：否则 _upsert_days 的排序会
+            # 拿 int 和 str 比较抛 TypeError，而异常发生在落盘之前，
+            # 每次刷新都在同一处崩，集成会一直 unavailable，只能手工删存储
+            self._daylist = _clean_daylist(daylist)
             daily = data.get("daily")
             self._daily = daily if isinstance(daily, dict) else {}
             rows = data.get("rows")
-            self._rows = (
-                [r for r in rows if isinstance(r, dict)]
-                if isinstance(rows, list)
+            # 存储可能来自不兼容的旧版本或被手工改坏：缺 qty 会让
+            # sum(r["qty"]) 抛 KeyError，month 是 int 会让 .startswith 崩，
+            # 两者都会把整次刷新打成失败（整屏 unavailable）
+            self._rows = _clean_rows(rows)
+            used = data.get("used_pays")
+            self._used_pays = (
+                [k for k in used if isinstance(k, str) and k]
+                if isinstance(used, list)
                 else []
             )
         else:
@@ -80,6 +89,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daylist = []
             self._daily = {}
             self._rows = []
+            self._used_pays = []
         # 旧版记录没有来源且日期可能偏移一天：不修改历史日期，只标记为 legacy，
         # 这样它不会被新的“严格昨日”实体当成真实单日结算。
         for row in self._daylist:
@@ -92,6 +102,8 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # daylist 为降序：内存与持久化都只保留最新 400 条，
         # 避免实时属性体积随运行天数无限增长
         self._daylist = self._daylist[:400]
+        # 已冲正缴费只需覆盖缴费接口的 181 天窗口，留 80 条足够
+        self._used_pays = self._used_pays[-80:]
         await self._store.async_save(
             {
                 "prev": self._prev,
@@ -99,8 +111,22 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "daily": self._daily,
                 # 接口故障重启后仍能算出档位和 ytd，不至于整屏空白
                 "rows": self._rows,
+                "used_pays": self._used_pays,
             }
         )
+
+    def _remember_pays(self, pays: list[dict[str, Any]]) -> None:
+        """记下已经冲正过的缴费，避免同一笔钱被重复冲正。
+
+        缴费接口只有月份没有缴费日，同月多笔时窗口里永远是同一批记录，
+        下一次结算会再次选中它们，导致用量被重复扣减（实测 20.8 方 vs 真实 0.8 方）。
+        """
+        keys = list(self._used_pays)
+        for p in pays:
+            key = _pay_key(p)
+            if key not in keys:
+                keys.append(key)
+        self._used_pays = keys[-80:]
 
     # ── 主刷新 ────────────────────────────────────────────
     async def _async_update_data(self) -> dict[str, Any]:
@@ -134,7 +160,8 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # 月度用气失败时沿用上次成功结果，避免 ytd/档位/种子一起归零
         try:
-            rows = await self.api.get_monthly_usage(now=now)
+            # 再洗一遍：接口实现变了（比如 qty 变成字符串）也不会把刷新打崩
+            rows = _clean_rows(await self.api.get_monthly_usage(now=now))
             monthly_ok = True
         except GasApiError as err:
             _LOGGER.warning("月度用气查询失败，沿用上次成功的数据: %s", err)
@@ -201,7 +228,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── 日用量（按 08:00 账期，用余额差值反推）─────────────
         # daily_* 始终描述“最近一次成功结算”，跨天但尚未出账时继续显示它。
-        daily_usage = self._daily.get("usage")
+        daily_usage = _to_float(self._daily.get("usage"))
         daily_basis = self._daily.get("basis", "")
         daily_date = self._daily.get("data_date")
         daily_source = self._daily.get("source")
@@ -375,6 +402,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else:
                         basis_extra = ""
                         skipped = False
+                        pending_used: list[dict[str, Any]] = []
                         end_day = current_settlement - timedelta(days=1)
 
                         if delta < 0:
@@ -390,23 +418,45 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 )
                                 skipped = True
                             else:
-                                fixed, used = _reconcile_payments(
-                                    pays, end_day, current_settlement, delta
+                                need = round(-delta, 2)
+                                fixed, used, reason = _reconcile_payments(
+                                    pays,
+                                    end_day,
+                                    current_settlement,
+                                    delta,
+                                    skip=self._used_pays,
+                                )
+                                used_total = round(
+                                    sum(
+                                        _to_float(p.get("amount")) or 0.0
+                                        for p in used
+                                    ),
+                                    2,
                                 )
                                 if fixed is not None:
                                     delta = fixed
-                                    total = round(
-                                        sum(float(p["amount"]) for p in used), 2
-                                    )
+                                    # 先别记“已冲正”：万一后面因为气价缺失
+                                    # 放弃落账，这笔钱还要留给下次用
+                                    pending_used = used
                                     basis_extra = (
                                         f"（已冲正 {len(used)} 笔缴费合计 "
-                                        f"{total:.2f} 元，为估算）"
+                                        f"{used_total:.2f} 元，为估算）"
                                     )
                                 else:
-                                    if used:
+                                    if reason == "mismatch":
+                                        detail = (
+                                            "缴费金额远大于余额上升"
+                                            f"（{used_total:.2f} 元 vs {need:.2f} 元），"
+                                            "冲正会造出假用量，"
+                                        )
+                                    elif reason == "insufficient":
                                         detail = (
                                             f"已找到 {len(used)} 笔缴费但合计不足，"
                                         )
+                                    elif reason == "all_used":
+                                        # 窗口里有记录，但都已在此前冲正过：
+                                        # 说成“无缴费”会让人误以为接口没数据
+                                        detail = "窗口内缴费均已在往期冲正，"
                                     else:
                                         detail = "无缴费记录可冲正，"
                                     daily_status = (
@@ -438,7 +488,12 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     f"跨 {days} 个账期余额均未变化，"
                                     "无法区分零用量与云端未出账，保持等待"
                                 )
-                            elif delta > 0 and not active_price:
+                            elif not active_price and not (
+                                delta == 0 and not basis_extra
+                            ):
+                                # 气价缺失（接口返回 0 或解析失败）时不能做除法。
+                                # 真实零用量不需要气价，只有它是例外；缴费冲正后
+                                # 恰好归零（basis_extra 非空）同样要除，必须挡住。
                                 daily_status = "气价未知，无法推算日用量"
                             else:
                                 # 当前账期结算的是昨天；跨 N 账期则归属 prev_settlement
@@ -446,6 +501,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 # 只有“余额原样未动”才算真实零用量；
                                 # 缴费冲正后归零属于估算，不能标成 balance
                                 is_zero = delta == 0 and not basis_extra
+                                zero_pending = bool(prev.get("zero_pending"))
                                 if is_zero:
                                     # 08:00 到 12:00 一直没变化：判定前一天真实零用量。
                                     # 不补零会一直等待，第二天按两天均摊并覆盖前一天真实值。
@@ -479,6 +535,12 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     if days > 1:
                                         daily_basis += f"，跨 {days} 天均摊"
                                     daily_basis += basis_extra
+                                    if zero_pending and delta > 0:
+                                        # 上一个账期刚判过零用量：这笔扣费很可能是
+                                        # 云端延迟出账（两天合一次扣），不能当成
+                                        # 严格单日真实值，否则“昨日”会翻倍
+                                        daily_source = "estimated"
+                                        daily_basis += "，可能含上一账期延迟出账"
                                     daily_status = "结算成功"
 
                                 daily_date = end_day.isoformat()
@@ -498,22 +560,31 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     now_iso=now_iso,
                                     price=active_price,
                                 )
+                                if pending_used:
+                                    # 落账成功后才把缴费记为“已用过”，
+                                    # 避免中途放弃时白耗一笔缴费的冲正额度
+                                    self._remember_pays(pending_used)
                                 if is_zero:
-                                    # 零用量只是“到点还没变化”的判定，不能推进
-                                    # 基准：云端迟一天才出账时，后续账期会把这段
-                                    # 窗口整体均摊，覆盖这些 0，不会永久记成零。
+                                    # 零用量已确认，基准必须跟着推进到当前采样点，
+                                    # 否则下一个账期会按 days=2 均摊，把这天
+                                    # 已确认的 0 覆盖成半天的用量（越算越错）。
+                                    # 云端迟出账的补扣走 days==0 分支，靠下面的
+                                    # from_balance / settled_day 合并回这一天。
                                     self._prev = {
-                                        **prev,
                                         "balance": balance_num,
                                         "date": today_key,
-                                    }
-                                    if days == 1:
-                                        # 只记一天的锚点，供同日补扣合并使用
-                                        self._prev["from_balance"] = prev_balance
-                                        self._prev["from_settlement"] = (
+                                        "sampled_at": now_iso,
+                                        "from_balance": prev_balance,
+                                        "from_settlement": (
                                             prev_settlement.isoformat()
-                                        )
-                                        self._prev["settled_day"] = end_day.isoformat()
+                                            if prev_settlement is not None
+                                            else None
+                                        ),
+                                        "settled_day": end_day.isoformat(),
+                                        # 下一个账期若突然扣费，可能是这次的延迟
+                                        # 出账，届时只能标估算，不能当单日真值
+                                        "zero_pending": True,
+                                    }
                                 else:
                                     self._prev = {
                                         "balance": balance_num,
@@ -760,7 +831,9 @@ def _upsert_days(
                 "price": price,
             },
         )
-    daylist.sort(key=lambda r: r.get("day", ""), reverse=True)
+    # 加载时已归一化，这里再加一层 str()：任何漏网的脏 day 都只影响排序
+    # 位置，不会让整个刷新抛 TypeError
+    daylist.sort(key=lambda r: str(r.get("day") or ""), reverse=True)
     return daylist
 
 
@@ -787,43 +860,154 @@ def _window_payments(
     return candidates
 
 
+def _pay_key(p: dict[str, Any]) -> str:
+    """缴费的唯一标识。
+
+    接口偶尔没有 paymentno，用“月份@金额”兜底，保证仍能去重；
+    这类兜底键在金额相同的两笔缴费上会误合并，但比重复冲正安全。
+    """
+    no = str(p.get("paymentno") or "").strip()
+    if no:
+        return no
+    amount = _to_float(p.get("amount")) or 0.0
+    return f"{p.get('month') or ''}@{amount:.2f}"
+
+
 def _reconcile_payments(
     pays: list[dict[str, Any]],
     end_day: date,
     settle_day: date | None,
     delta: float,
-) -> tuple[float | None, list[dict[str, Any]]]:
+    skip: Any = (),
+) -> tuple[float | None, list[dict[str, Any]], str]:
     """用窗口内的缴费把负差额（余额上升）冲正回真实用气成本。
 
-    返回 (冲正后成本, 实际采用的缴费)：
-      - (成本, [一笔或多笔]) 冲正成功
-      - (None, [])           窗口内没有缴费记录
-      - (None, [有记录])     缴费合计仍不足以覆盖上升额，数据可疑
+    返回 (冲正后成本, 实际采用的缴费, 原因)：
+      - (成本, [..], "")              冲正成功
+      - (None, [], "no_candidate")    窗口内没有可用缴费
+      - (None, [..], "all_used")      窗口内的缴费都已在此前冲正过
+      - (None, [..], "insufficient")  合计仍不足以覆盖上升额
+      - (None, [..], "mismatch")      金额远大于上升额，冲了会造出假用量
 
-    只取一笔会在“同月多笔缴费”时把差额全部算成异常并丢数据，所以
-    从最新一笔开始逐笔累加，凑够即停（尽量少用，避免过度冲正）。
+    选笔策略：先找“够用且金额最小”的单笔（最常见的就是一笔正好对上），
+    都不够才按金额从小到大累加。原来的“按月份取最新、逐笔累加”会把一笔
+    100 元缴费拿去冲 5 元的上升，算出 38 方这种错值。
+    skip 里是往期已经冲正过的缴费键（见 _pay_key）：不排除掉它们，
+    同一笔钱会在后续每个账期被再冲一次，用量成倍虚高。
     """
     candidates = _window_payments(pays, end_day, settle_day)
+    if skip:
+        used_keys = {str(k) for k in skip}
+        remaining = [p for p in candidates if _pay_key(p) not in used_keys]
+        if candidates and not remaining:
+            return None, [], "all_used"
+        candidates = remaining
     if not candidates:
-        return None, []
+        return None, [], "no_candidate"
+
+    need = round(-delta, 2)
+    amounts = {_pay_key(p): (_to_float(p.get("amount")) or 0.0) for p in candidates}
+
+    covering = sorted(
+        (p for p in candidates if amounts[_pay_key(p)] >= need),
+        key=lambda p: amounts[_pay_key(p)],
+    )
+    if covering:
+        chosen = covering[0]
+        total = round(amounts[_pay_key(chosen)], 2)
+        if total > need * MAX_OVERPAY_RATIO:
+            # 缺口只有一点点，窗口里却只有一笔大额缴费：多半是它已经
+            # 在别的账期花掉了，再冲就会凭空造出一大笔用量
+            return None, [chosen], "mismatch"
+        return round(delta + total, 2), [chosen], ""
 
     used: list[dict[str, Any]] = []
     total = 0.0
-    fixed = delta
-    for p in candidates:
-        if fixed >= 0:
-            break
+    for p in sorted(candidates, key=lambda p: amounts[_pay_key(p)]):
         used.append(p)
-        total += float(p.get("amount") or 0)
-        fixed = round(delta + total, 2)
+        total = round(total + amounts[_pay_key(p)], 2)
+        if total >= need:
+            break
 
-    if fixed < 0:
-        return None, used
-    return fixed, used
+    if total < need:
+        return None, used, "insufficient"
+    if total > need * MAX_OVERPAY_RATIO:
+        return None, used, "mismatch"
+    return round(delta + total, 2), used, ""
 
 
 def _to_float(v: Any) -> float | None:
+    """转数字；非数字和 NaN/inf 都返回 None。
+
+    NaN/inf 是“能转成 float 但不能参与计算”的脏值：放进去会让全年累计
+    变成 nan、档位匹配全部落空，而且 JSON 序列化出来也不是合法数字。
+    """
     try:
-        return float(v)
+        x = float(v)
     except (TypeError, ValueError):
         return None
+    return x if math.isfinite(x) else None
+
+
+def _clean_daylist(daylist: Any) -> list[dict[str, Any]]:
+    """校验并归一化持久化的逐日用量。
+
+    必须是合法日期（统一成 ISO 字符串）且 f_gas 是有限数字，其余丢弃。
+    存储被手工改坏或来自不兼容版本时，int 类型的 day 会让 _upsert_days
+    的排序抛 TypeError，而落盘在排序之后，等于永久卡死。
+    """
+    if not isinstance(daylist, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in daylist:
+        if not isinstance(r, dict):
+            continue
+        day = _parse_day(r.get("day"))
+        f_gas = _to_float(r.get("f_gas"))
+        if day is None or f_gas is None:
+            _LOGGER.debug("忽略非法逐日记录: %r", r)
+            continue
+        row = dict(r)
+        row["day"] = day.isoformat()
+        row["f_gas"] = f_gas
+        out.append(row)
+    # 下游按降序取最新，存储里也保持同样顺序
+    out.sort(key=lambda r: r["day"], reverse=True)
+    return out
+
+
+def _clean_rows(rows: Any) -> list[dict[str, Any]]:
+    """校验并归一化月度用气数据。
+
+    month 必须是 6 位数字（YYYYMM）且月份 1~12，qty 必须能转成数字；
+    不合法的整条丢弃，缺 prev/cur/read_date 的补默认值。逐条过滤而不是
+    整组丢弃，避免一条脏数据把一年的历史全清空。
+    """
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        month = str(r.get("month") or "").strip()
+        qty = _to_float(r.get("qty"))
+        if (
+            len(month) != 6
+            or not month.isdigit()
+            or not 1 <= int(month[4:6]) <= 12
+            or qty is None
+        ):
+            _LOGGER.debug("忽略非法月度用气记录: %r", r)
+            continue
+        out.append(
+            {
+                "month": month,
+                "qty": qty,
+                "prev": _to_float(r.get("prev")) or 0.0,
+                "cur": _to_float(r.get("cur")) or 0.0,
+                "read_date": str(r.get("read_date") or ""),
+            }
+        )
+    # 下游依赖“最新的月份在 rows[0]”
+    out.sort(key=lambda r: r["month"], reverse=True)
+    return out

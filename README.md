@@ -18,7 +18,8 @@
 | `sensor.gas_usage_12m` | 近 12 个月用气 |
 | `sensor.gas_meter_reading` | 燃气表读数（`device_class: gas`，可用于能源面板） |
 | `sensor.gas_reading_age` | 读数滞后天数 |
-| `sensor.gas_daily_usage` | 日用量（用余额差值推算，**不需要硬件**） |
+| `sensor.gas_daily_usage` | 最近结算日用量（余额差值推算，**不需要硬件**；属性含归属日期和来源） |
+| `sensor.gas_yesterday_usage` | 昨日用气量（严格值：仅单日真实余额差，08:00 前为未知） |
 | `sensor.gas_payment` | 缴费（最近一笔 + 本月合计 + 明细） |
 | `sensor.gas_stop_notice` | 停气通知 |
 | `sensor.gas_info` | 结构化实体，给 [`electricity-info-card`](https://github.com/chjspp520/electricity-info-card) 画燃气卡片用 |
@@ -61,7 +62,8 @@
 
 - **余额**：云端是日更的，30 分钟够用
 - **用气量**：云端只在**抄表日**（约每月 23 号）出，所以 `gas_month_usage` 平时一直是上个月的值 —— 这是服务端的限制，不是集成的问题
-- **日用量**：靠两次刷新的余额差推算，所以至少要跑满一天才有数
+- **日用量**：云端每天约 08:00 结算前一天余额，集成据此反推。`gas_daily_usage` 是最近一次成功结算值（可能来自更早日期），`gas_yesterday_usage` 只在昨日有单日真实余额差时出值；08:00 前、云端未出账、停机跨天均摊或缴费冲正时，“昨日”保持未知，不用估算值充数
+- **历史记录**：升级前的旧日用量不整体平移日期，只标记为 `legacy`（日期口径可能偏移）；新记录从升级后开始按归属日期和来源区分
 
 ## 配合 electricity-info-card
 

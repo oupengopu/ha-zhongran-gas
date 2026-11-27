@@ -172,12 +172,39 @@ SENSORS: tuple[GasSensorDescription, ...] = (
         name="日用量（余额推算）",
         native_unit_of_measurement="m³",
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:calendar-today",
+        icon="mdi:calendar-check-outline",
         value_fn=lambda d: d["daily_usage"],
         attr_fn=lambda d: {
+            "数据日期": d["daily_date"],
+            "结算时间": d["daily_settled_at"],
+            "数据来源": {
+                "balance": "余额差真实结算",
+                "estimated": "跨天均摊或缴费冲正，估算",
+                "seed": "月度数据均摊种子",
+                "legacy": "旧版记录（日期口径可能偏移）",
+            }.get(d["daily_source"], "旧版缓存或尚未结算"),
             "推算依据": d["daily_basis"],
-            "使用气价": d["price"],
-            "说明": "用两次刷新的余额差 ÷ 气价推算；缴费自动冲正，跨多天自动均摊",
+            "本次状态": d["daily_status"],
+            "使用气价": d["daily_price"] or d["price"],
+            "说明": "最近一次成功结算的用气量；归属日期见数据日期，跨天或缴费冲正会标明估算",
+        },
+    ),
+    GasSensorDescription(
+        key="yesterday_usage",
+        translation_key="yesterday_usage",
+        name="昨日用气量",
+        native_unit_of_measurement="m³",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:calendar-arrow-left",
+        value_fn=lambda d: d["yesterday_usage"],
+        attr_fn=lambda d: {
+            "数据日期": d["yesterday_date"],
+            "数据来源": "余额差真实结算" if d["yesterday_usage"] is not None else None,
+            "推算依据": d["yesterday_basis"],
+            "说明": (
+                "严格昨日值：只接受单日、无缴费冲正的余额差；"
+                "每天 08:00 前及云端未出账时为未知，均摊和种子数据不计入"
+            ),
         },
     ),
     GasSensorDescription(

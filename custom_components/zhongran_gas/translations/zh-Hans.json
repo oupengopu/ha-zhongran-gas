@@ -34,6 +34,10 @@
           "mas": "新 x-mas-app-info（留空不变）"
         }
       }
+    },
+    "error": {
+      "cannot_connect": "连接失败，新凭据未保存，检查网络或参数",
+      "invalid_auth": "accessToken 无效，新凭据未保存，请重新抓取"
     }
   }
 }

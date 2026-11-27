@@ -20,6 +20,18 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _looks_like_auth_error(msg: str) -> bool:
+    """从接口错误文案判断是不是凭据问题。
+
+    服务端换文案时会退化成 cannot_connect，只影响提示分类，不影响功能。
+    """
+    low = msg.lower()
+    if "token" in low or "auth" in low:
+        return True
+    return "登录" in msg or "鉴权" in msg
+
+
 STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required("access_token"): str,
@@ -61,11 +73,11 @@ class ZhongranGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 info = await api.get_cust_info()
             except GasApiError as err:
                 _LOGGER.warning("验证失败: %s", err)
-                msg = str(err)
-                if "token" in msg.lower() or "登录" in msg or "鉴权" in msg:
-                    errors["base"] = "invalid_auth"
-                else:
-                    errors["base"] = "cannot_connect"
+                errors["base"] = (
+                    "invalid_auth"
+                    if _looks_like_auth_error(str(err))
+                    else "cannot_connect"
+                )
             else:
                 # 标题不要带余额 —— 否则 entity_id 会变成
                 # sensor.ran_qi_mou_ji_xia_yu_e_180_07_xxx 这种拼音串
@@ -94,19 +106,48 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
+        errors: dict[str, str] = {}
+
         if user_input is not None:
             data: dict[str, Any] = {
-                "scan_interval": user_input["scan_interval"]
+                "scan_interval": user_input.get(
+                    "scan_interval", DEFAULT_SCAN_INTERVAL
+                )
             }
             # 凭据留空 = 不修改；非空则覆盖（coordinator 里 options 优先于 data）
+            changed = False
             for key in ("access_token", "user_id", "mas"):
                 new_value = (user_input.get(key) or "").strip()
-                old_value = self.config_entry.options.get(key)
+                old_value = self._current(key)
                 if new_value:
                     data[key] = new_value
+                    changed = changed or new_value != old_value
                 elif old_value:
                     data[key] = old_value
-            return self.async_create_entry(title="", data=data)
+
+            # 新凭据先验证再落库：粘错 token 会让 entry 进入 SETUP_RETRY，
+            # 所有实体一起 unavailable，只能再进选项页改回来
+            if changed:
+                api = ZhongranGasApi(
+                    async_get_clientsession(self.hass),
+                    access_token=data.get("access_token", ""),
+                    user_id=data.get("user_id", ""),
+                    cust_code=self._current("cust_code"),
+                    cust_name=self._current("cust_name"),
+                    mas=data.get("mas", ""),
+                )
+                try:
+                    await api.get_cust_info()
+                except GasApiError as err:
+                    _LOGGER.warning("新凭据验证失败: %s", err)
+                    errors["base"] = (
+                        "invalid_auth"
+                        if _looks_like_auth_error(str(err))
+                        else "cannot_connect"
+                    )
+
+            if not errors:
+                return self.async_create_entry(title="", data=data)
 
         cur = self.config_entry.options.get(
             "scan_interval", DEFAULT_SCAN_INTERVAL
@@ -123,7 +164,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Optional("mas", default=""): str,
                 }
             ),
+            errors=errors,
             description_placeholders={
-                "note": "凭据留空表示保持不变；accessToken 过期时只需粘贴新值，保存后自动重载"
+                "note": "凭据留空表示保持不变；accessToken 过期时只需粘贴新值，保存前会先验证"
             },
+        )
+
+    def _current(self, key: str) -> str:
+        """选项优先，其次原始配置。"""
+        return str(
+            self.config_entry.options.get(key)
+            or self.config_entry.data.get(key)
+            or ""
         )

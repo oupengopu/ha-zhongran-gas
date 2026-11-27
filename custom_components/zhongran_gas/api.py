@@ -38,6 +38,30 @@ class GasApiError(Exception):
     """接口异常。"""
 
 
+def _is_empty_payload(data: Any) -> bool:
+    """判断“没有记录”的各种空外壳。
+
+    停气接口用 {"list": []} / {"total": 0} / [{}] 表示无记录时，
+    单纯用真值判断会把它当成“有停气”，进而误触发告警自动化。
+    """
+    if not data:
+        return True
+    if isinstance(data, list):
+        return all(_is_empty_payload(x) for x in data)
+    if isinstance(data, dict):
+        if not any(v for v in data.values()):
+            return True
+        # “列表 + 计数”的空外壳：列表存在且为空、计数也没有正值
+        for key in ("list", "rows", "records", "data"):
+            value = data.get(key)
+            if isinstance(value, list) and not value:
+                if not any(data.get(k) for k in ("total", "count")):
+                    return True
+            elif isinstance(value, dict) and _is_empty_payload(value):
+                return True
+    return False
+
+
 class ZhongranGasApi:
     """一个用户的接口封装。"""
 
@@ -89,9 +113,15 @@ class ZhongranGasApi:
                 headers=self._headers(),
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                status = resp.status
                 text = await resp.text()
         except (aiohttp.ClientError, TimeoutError) as err:
             raise GasApiError(f"网络错误: {err}") from err
+
+        if status >= 400:
+            # 网关错误页通常是 HTML，直接解析只会得到“返回不是 JSON”，
+            # 真正的状态码信息就丢了，排查时看不出是 502 还是 401
+            raise GasApiError(f"HTTP {status}: {text[:200]}")
 
         try:
             return json.loads(text)
@@ -155,8 +185,12 @@ class ZhongranGasApi:
         return {"price": price, "tiers": tiers}
 
     # ── ③ 月度用气（methodEncrypt.do）────────────────────────
-    async def get_monthly_usage(self, months: int = 12) -> list[dict[str, Any]]:
-        now = datetime.now()
+    async def get_monthly_usage(
+        self, months: int = 12, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        # 用调用方传入的时间（HA 配置时区），避免容器是 UTC 时
+        # 月初/跨日的查询窗口整体偏移
+        now = now or datetime.now()
         end_m = now.strftime("%Y%m")
         start_m = (now - timedelta(days=365)).strftime("%Y%m")
 
@@ -236,16 +270,23 @@ class ZhongranGasApi:
             _LOGGER.warning("停气查询失败: %s", err)
             return {"has_stop": False, "detail": "查询失败"}
 
-        if str(j.get("status")) == "1" and j.get("data"):
-            return {
-                "has_stop": True,
-                "detail": json.dumps(j["data"], ensure_ascii=False)[:900],
-            }
-        return {"has_stop": False, "detail": j.get("message") or "无"}
+        if str(j.get("status")) != "1":
+            return {"has_stop": False, "detail": j.get("message") or "无"}
+        data = j.get("data")
+        if _is_empty_payload(data):
+            # {"list": []} / {"total": 0} / [{}] 这类“空外壳”代表没有停气，
+            # 按真值判断会误报，进而误触发用户告警自动化
+            return {"has_stop": False, "detail": j.get("message") or "无"}
+        return {
+            "has_stop": True,
+            "detail": json.dumps(data, ensure_ascii=False)[:900],
+        }
 
     # ── ⑤ 缴费明细 ───────────────────────────────────────────
-    async def get_payments(self, days: int = 181) -> list[dict[str, Any]]:
-        now = datetime.now()
+    async def get_payments(
+        self, days: int = 181, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        now = now or datetime.now()
         end = now.strftime("%Y%m%d")
         start = (now - timedelta(days=days)).strftime("%Y%m%d")
         ts = self._ts()

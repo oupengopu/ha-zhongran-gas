@@ -252,6 +252,7 @@ SENSORS: tuple[GasSensorDescription, ...] = (
             "预付费": "是",
             "数据源": "中燃在线",
             "最后同步日期": d["sync_time"],
+            "数据状态": d["data_status"],
             "本月用电": d["month_usage"] or 0,
             "本年用电": d["ytd"],
             "当前档位": d["tier_index"] + 1,

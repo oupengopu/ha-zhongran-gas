@@ -177,7 +177,7 @@ SENSORS: tuple[GasSensorDescription, ...] = (
         attr_fn=lambda d: {
             "推算依据": d["daily_basis"],
             "使用气价": d["price"],
-            "说明": "用两次刷新的余额差 ÷ 气价推算；有缴费当天不计算",
+            "说明": "用两次刷新的余额差 ÷ 气价推算；缴费自动冲正，跨多天自动均摊",
         },
     ),
     GasSensorDescription(

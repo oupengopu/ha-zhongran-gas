@@ -39,6 +39,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._prev: dict[str, Any] = {}
         self._daylist: list[dict[str, Any]] = []
+        self._daily: dict[str, Any] = {}  # 当天已结算的日用量缓存
 
         super().__init__(
             hass,
@@ -53,10 +54,15 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if isinstance(data, dict):
             self._prev = data.get("prev") or {}
             self._daylist = data.get("daylist") or []
+            self._daily = data.get("daily") or {}
 
     async def _async_save_storage(self) -> None:
         await self._store.async_save(
-            {"prev": self._prev, "daylist": self._daylist[-400:]}
+            {
+                "prev": self._prev,
+                "daylist": self._daylist[-400:],
+                "daily": self._daily,
+            }
         )
 
     # ── 主刷新 ────────────────────────────────────────────
@@ -87,7 +93,9 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         next_price = None
         names = ["第一档", "第二档", "第三档", "第四档", "第五档"]
         for i, t in enumerate(tiers):
-            if t["from"] <= ytd <= t["to"]:
+            # 只比上限：档位之间可能有间隙（如 360 < ytd < 361），
+            # 双向比较会落空导致档位名空白、价格错用第一档
+            if ytd <= t["to"] or i == len(tiers) - 1:
                 tier_idx = i
                 tier_label = names[i] if i < len(names) else f"第{i + 1}档"
                 if i + 1 < len(tiers):
@@ -115,34 +123,103 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         daily_usage = None
         daily_basis = ""
         today_key = today.isoformat()
+        this_month = today.strftime("%Y%m")
         prev = self._prev
-        if prev.get("balance") is not None and prev.get("date") != today_key:
-            delta = float(prev["balance"]) - (balance_num or 0)
-            if active_price and delta >= 0:
-                daily_usage = round(delta / active_price, 3)
-                daily_basis = (
-                    f"{prev.get('date')} {float(prev['balance']):.2f}元 → "
-                    f"{today_key} {(balance_num or 0):.2f}元"
-                )
-                self._daylist.insert(
-                    0,
-                    {
-                        "day": today_key,
-                        "f_gas": daily_usage,
-                        "e_gas": round(delta, 2),
-                        "tier": tier_idx + 1,
-                        "balance": balance_num,
-                    },
-                )
-            else:
-                daily_basis = "余额上升（有缴费）或数据异常，本次不计算"
-        elif not prev:
-            daily_basis = f"首次运行，{today_key} 之后才有日用量"
 
-        self._prev = {"balance": balance_num, "date": today_key}
+        if self._daily.get("date") == today_key:
+            # 今天已结算过，直接复用缓存，sensor 整天都有值
+            daily_usage = self._daily.get("usage")
+            daily_basis = self._daily.get("basis", "")
+        elif balance_num is None:
+            # 余额没拿到：绝不能按 0 算，也不覆盖基准
+            daily_basis = "本次余额获取失败，跳过日用量计算，保留上一基准"
+        else:
+            prev_balance = prev.get("balance")
+            prev_date = prev.get("date")
+            if prev_balance is None or not prev_date:
+                daily_basis = f"首次运行，{today_key} 之后才有日用量"
+                self._prev = {"balance": balance_num, "date": today_key}
+            elif prev_date == today_key:
+                daily_basis = "今日已结算，等待明日跨天"
+            else:
+                try:
+                    days = max((today - date.fromisoformat(prev_date)).days, 1)
+                except ValueError:
+                    days = 1
+                delta = round(float(prev_balance) - balance_num, 2)
+                basis_extra = ""
+                skipped = False
+
+                if delta < 0:
+                    # 余额变多 = 有缴费。尝试用当月最近一笔缴费冲正
+                    latest = pays[0] if pays else None
+                    fixed = None
+                    if latest and latest["month"] == this_month:
+                        candidate = round(delta + float(latest["amount"]), 2)
+                        if candidate >= 0:
+                            fixed = candidate
+                    if fixed is not None:
+                        delta = fixed
+                        basis_extra = (
+                            f"（已冲正缴费 {float(latest['amount']):.2f} 元，为估算）"
+                        )
+                    else:
+                        # 无法冲正：放弃当天，但基准必须重置，否则明天算出负值
+                        daily_basis = (
+                            f"{prev_date} {float(prev_balance):.2f}元 → "
+                            f"{today_key} {balance_num:.2f}元：余额上升且无法冲正，本日不计算"
+                        )
+                        self._prev = {"balance": balance_num, "date": today_key}
+                        self._daily = {
+                            "date": today_key,
+                            "usage": None,
+                            "basis": daily_basis,
+                        }
+                        skipped = True
+
+                if not skipped:
+                    if delta == 0 and days == 1:
+                        # 大概率云端还没日更出账：保留昨日基准，等下次刷新再算
+                        daily_basis = "余额与昨日一致，可能云端尚未出账，等待下次刷新"
+                    elif not active_price:
+                        daily_basis = "气价未知，无法推算日用量"
+                    else:
+                        per_cost = round(delta / days, 2)
+                        daily_usage = round(per_cost / active_price, 3)
+                        daily_basis = (
+                            f"{prev_date} {float(prev_balance):.2f}元 → "
+                            f"{today_key} {balance_num:.2f}元"
+                        )
+                        if days > 1:
+                            daily_basis += f"，跨 {days} 天均摊"
+                        daily_basis += basis_extra
+                        # 回填 days 天；同日期条目先删再插，避免与种子数据重复
+                        for i in range(days):
+                            day_key = (today - timedelta(days=i)).isoformat()
+                            self._daylist = [
+                                r for r in self._daylist if r.get("day") != day_key
+                            ]
+                            self._daylist.insert(
+                                0,
+                                {
+                                    "day": day_key,
+                                    "f_gas": daily_usage,
+                                    "e_gas": per_cost,
+                                    "tier": tier_idx + 1,
+                                    "balance": balance_num if i == 0 else None,
+                                },
+                            )
+                        self._daylist.sort(
+                            key=lambda r: r.get("day", ""), reverse=True
+                        )
+                        self._prev = {"balance": balance_num, "date": today_key}
+                        self._daily = {
+                            "date": today_key,
+                            "usage": daily_usage,
+                            "basis": daily_basis,
+                        }
 
         # ── 缴费 ─────────────────────────────────────────────
-        this_month = today.strftime("%Y%m")
         pay_total = round(sum(p["amount"] for p in pays), 2)
         pay_month = round(
             sum(p["amount"] for p in pays if p["month"] == this_month), 2

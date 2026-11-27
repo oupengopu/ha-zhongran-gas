@@ -26,8 +26,12 @@
     "step": {
       "init": {
         "title": "选项",
+        "description": "{note}",
         "data": {
-          "scan_interval": "刷新间隔（分钟）"
+          "scan_interval": "刷新间隔（分钟）",
+          "access_token": "新 accessToken（留空不变）",
+          "user_id": "新 userId（留空不变）",
+          "mas": "新 x-mas-app-info（留空不变）"
         }
       }
     }

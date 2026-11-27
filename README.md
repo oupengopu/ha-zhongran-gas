@@ -110,7 +110,7 @@ action:
 ## 注意事项
 
 - 这是**非官方**集成，用的是「中燃在线」小程序的私有接口，接口变了就要跟着改
-- `accessToken` 会过期，过期后集成会显示 `binary_sensor.gas_sync_ok = off`，重新抓一次 token 然后到集成选项里更新
+- `accessToken` 会过期，过期后集成会显示 `binary_sensor.gas_sync_ok = off`，重新抓一次 token 然后到集成选项里粘贴新值保存即可（选项里留空的凭据保持不变，保存后自动重载）
 - **不要高频请求** —— 服务端有防护，30 分钟一次已经很够了
 
 ## License

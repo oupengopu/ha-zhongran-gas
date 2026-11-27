@@ -251,6 +251,11 @@ class GasSensor(CoordinatorEntity[GasCoordinator], SensorEntity):
     # 关掉设备名前缀，自己指定 entity_id（否则会变成
     # sensor.ran_qi_mou_ji_xia_yu_e_180_07_yu_e 这种拼音串）
     _attr_has_entity_name = False
+    # 这些大列表只给 gas_info 的前端卡片实时读取；超过 16KB 的属性会被
+    # recorder 整组拒存，所以只把它们排除出历史记录，不影响卡片。
+    # 必须在类体定义：Entity.__init_subclass__ 此时才合并该集合，
+    # 实例 __init__ 里赋值不会生效。其他实体没有这些属性名，不受影响。
+    _unrecorded_attributes = frozenset({"daylist", "monthlist", "yearlist"})
 
     def __init__(
         self,

@@ -57,10 +57,13 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily = data.get("daily") or {}
 
     async def _async_save_storage(self) -> None:
+        # daylist 为降序：内存与持久化都只保留最新 400 条，
+        # 避免实时属性体积随运行天数无限增长
+        self._daylist = self._daylist[:400]
         await self._store.async_save(
             {
                 "prev": self._prev,
-                "daylist": self._daylist[-400:],
+                "daylist": self._daylist,
                 "daily": self._daily,
             }
         )
@@ -264,7 +267,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         }
                     )
             seed.reverse()
-            self._daylist = seed[-400:]
+            self._daylist = seed[:400]  # 已 reverse 为降序，取最新 400 天
 
         tier_info = {
             "计费标准": "年阶梯",

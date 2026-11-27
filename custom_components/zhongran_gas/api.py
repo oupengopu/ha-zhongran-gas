@@ -195,9 +195,19 @@ class ZhongranGasApi:
         rows: list[dict[str, Any]] = []
         for x in lst:
             try:
+                month = str(x.get("recordMonth") or "")
+                # 下游按 YYYYMM 切片/比较，格式不符的记录直接丢弃，
+                # 避免 seed 里 int() 抛异常拖垮整个刷新
+                if (
+                    len(month) != 6
+                    or not month.isdigit()
+                    or not 1 <= int(month[4:6]) <= 12
+                ):
+                    _LOGGER.warning("忽略非法抄表月份: %r", month)
+                    continue
                 rows.append(
                     {
-                        "month": str(x.get("recordMonth")),
+                        "month": month,
                         "prev": float(x.get("lastRecord", 0)),
                         "cur": float(x.get("curRecord", 0)),
                         "qty": float(x.get("curQty", 0)),
@@ -206,6 +216,8 @@ class ZhongranGasApi:
                 )
             except (TypeError, ValueError):
                 continue
+        # 不依赖服务端返回顺序：最新的月份永远在 rows[0]
+        rows.sort(key=lambda r: r["month"], reverse=True)
         return rows
 
     # ── ④ 停气通知 ───────────────────────────────────────────
@@ -252,13 +264,21 @@ class ZhongranGasApi:
         if str(j.get("status")) == "1" and isinstance(j.get("data"), list):
             for x in j["data"]:
                 try:
+                    month_raw = str(x.get("recordmonth") or "")
+                    # 归一化成 YYYYMM（兼容 2026-11 之类格式），
+                    # 供 coordinator 与当月比较做缴费冲正
+                    digits = "".join(c for c in month_raw if c.isdigit())
+                    month = digits[:6] if len(digits) >= 6 else month_raw
                     rows.append(
                         {
-                            "month": str(x.get("recordmonth") or ""),
+                            "month": month,
                             "amount": float(x.get("amount") or 0),
                             "paymentno": str(x.get("paymentno") or ""),
                         }
                     )
                 except (TypeError, ValueError):
                     continue
+        # 稳定排序：保证最近月份在前；同月内保持服务端原顺序
+        # （接口没有缴费日字段，同月多笔无法进一步区分先后）
+        rows.sort(key=lambda r: r["month"], reverse=True)
         return rows

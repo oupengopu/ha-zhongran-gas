@@ -89,13 +89,24 @@ class ZhongranGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    """修改刷新间隔。"""
+    """修改刷新间隔 / 更新过期凭据。"""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            data: dict[str, Any] = {
+                "scan_interval": user_input["scan_interval"]
+            }
+            # 凭据留空 = 不修改；非空则覆盖（coordinator 里 options 优先于 data）
+            for key in ("access_token", "user_id", "mas"):
+                new_value = (user_input.get(key) or "").strip()
+                old_value = self.config_entry.options.get(key)
+                if new_value:
+                    data[key] = new_value
+                elif old_value:
+                    data[key] = old_value
+            return self.async_create_entry(title="", data=data)
 
         cur = self.config_entry.options.get(
             "scan_interval", DEFAULT_SCAN_INTERVAL
@@ -107,6 +118,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Optional("scan_interval", default=cur): vol.All(
                         int, vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL)
                     ),
+                    vol.Optional("access_token", default=""): str,
+                    vol.Optional("user_id", default=""): str,
+                    vol.Optional("mas", default=""): str,
                 }
             ),
+            description_placeholders={
+                "note": "凭据留空表示保持不变；accessToken 过期时只需粘贴新值，保存后自动重载"
+            },
         )

@@ -19,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
 SETTLEMENT_HOUR = 8  # 云端通常每天 08:00 左右结算前一天用量
+ZERO_CONFIRM_HOUR = 12  # 到这时余额仍未变化，才判定前一天为真实零用量
 
 
 class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -54,14 +55,29 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_load_storage(self) -> None:
         data = await self._store.async_load()
         if isinstance(data, dict):
-            self._prev = data.get("prev") or {}
-            self._daylist = data.get("daylist") or []
-            self._daily = data.get("daily") or {}
+            # 存储可能被手工改坏或来自不兼容的旧版本：逐项校验类型，
+            # 任何异常字段都退回空值，避免启动时抛错或后续 .get 崩掉
+            prev = data.get("prev")
+            self._prev = prev if isinstance(prev, dict) else {}
+            daylist = data.get("daylist")
+            self._daylist = (
+                [r for r in daylist if isinstance(r, dict)]
+                if isinstance(daylist, list)
+                else []
+            )
+            daily = data.get("daily")
+            self._daily = daily if isinstance(daily, dict) else {}
+        else:
+            self._prev = {}
+            self._daylist = []
+            self._daily = {}
         # 旧版记录没有来源且日期可能偏移一天：不修改历史日期，只标记为 legacy，
         # 这样它不会被新的“严格昨日”实体当成真实单日结算。
         for row in self._daylist:
-            if isinstance(row, dict):
-                row.setdefault("source", "legacy")
+            row.setdefault("source", "legacy")
+        # 旧版 _daily 缓存同样没有来源，不能被当成新口径的真实值
+        if self._daily and not self._daily.get("source"):
+            self._daily["source"] = "legacy"
 
     async def _async_save_storage(self) -> None:
         # daylist 为降序：内存与持久化都只保留最新 400 条，
@@ -82,9 +98,18 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             price = await self.api.get_price_info()
             rows = await self.api.get_monthly_usage()
             stop = await self.api.get_stop_gas()
-            pays = await self.api.get_payments()
         except GasApiError as err:
             raise UpdateFailed(str(err)) from err
+
+        # 缴费明细单独查询：它只用于缴费冲正和缴费实体，失败不应该
+        # 让整次刷新失败，更不能被当成“没有缴费”去重置余额基准
+        try:
+            pays = await self.api.get_payments()
+            payments_ok = True
+        except GasApiError as err:
+            _LOGGER.warning("缴费记录查询失败，本次不做缴费冲正: %s", err)
+            pays = []
+            payments_ok = False
 
         tiers = price.get("tiers") or DEFAULT_TIERS
         now = dt_util.now()
@@ -152,7 +177,8 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # 余额没拿到：绝不能按 0 算，也不覆盖基准和最近成功结算。
             daily_status = "本次余额获取失败，跳过日用量计算，保留上一基准"
         else:
-            prev_balance = prev.get("balance")
+            # 存储里可能是脏值：统一转成数字，失败就当没有基准
+            prev_balance = _to_float(prev.get("balance"))
             prev_date = prev.get("date")
             if prev_balance is None or not prev_date:
                 daily_status = f"首次运行，已建立 {now_iso} 的余额基准"
@@ -161,19 +187,29 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "date": today_key,
                     "sampled_at": now_iso,
                 }
+            elif not prev.get("sampled_at"):
+                # 旧版基准只有日期，无法判断它写在 08:00 之前还是之后。
+                # 猜错会一次性多算一个账期（用量翻倍且日期错位），
+                # 所以保守处理：不计算，直接用当前余额重建基准，只少算一天。
+                daily_status = (
+                    "旧版余额基准缺少采样时间，已按当前余额重建，"
+                    "下一个账期开始结算"
+                )
+                self._prev = {
+                    "balance": balance_num,
+                    "date": today_key,
+                    "sampled_at": now_iso,
+                }
             else:
-                # 新版按实际采样时间确定账期；旧版只有日期，兼容为当天 08:00 后。
+                # 按实际采样时间确定账期
                 prev_settlement = None
                 try:
-                    if prev.get("sampled_at"):
-                        sampled_at = datetime.fromisoformat(prev["sampled_at"])
-                        prev_settlement = (
-                            sampled_at.date()
-                            if sampled_at.hour >= SETTLEMENT_HOUR
-                            else sampled_at.date() - timedelta(days=1)
-                        )
-                    else:
-                        prev_settlement = date.fromisoformat(prev_date)
+                    sampled_at = datetime.fromisoformat(prev["sampled_at"])
+                    prev_settlement = (
+                        sampled_at.date()
+                        if sampled_at.hour >= SETTLEMENT_HOUR
+                        else sampled_at.date() - timedelta(days=1)
+                    )
                 except (TypeError, ValueError):
                     daily_status = "旧余额基准时间无效，已重新建立基准"
                     self._prev = {
@@ -184,22 +220,92 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 if prev_settlement is not None:
                     days = (current_settlement - prev_settlement).days
-                    if days <= 0:
+                    delta = round(float(prev_balance) - balance_num, 2)
+
+                    if days < 0:
+                        # 系统时间被回拨之类：基准比当前账期还新，直接重建
                         daily_status = (
-                            f"等待今天 {SETTLEMENT_HOUR:02d}:00 后云端结算昨日用量"
-                            if now.hour < SETTLEMENT_HOUR
-                            else "当前账期已处理，等待下一次云端结算"
+                            "账期早于余额基准（系统时间可能被调整），已重新建立基准"
                         )
+                        self._prev = {
+                            "balance": balance_num,
+                            "date": today_key,
+                            "sampled_at": now_iso,
+                        }
+                    elif days == 0:
+                        # 同一账期内余额又变了：只可能是零用量判定后云端才补扣
+                        fix_key = (current_settlement - timedelta(days=1)).isoformat()
+                        zero_row = next(
+                            (
+                                r
+                                for r in self._daylist
+                                if r.get("day") == fix_key
+                                and r.get("source") == "balance"
+                                and _to_float(r.get("f_gas")) == 0
+                            ),
+                            None,
+                        )
+                        if delta > 0 and active_price and zero_row is not None:
+                            usage = round(delta / active_price, 3)
+                            zero_row.update(
+                                {
+                                    "f_gas": usage,
+                                    "e_gas": delta,
+                                    "tier": tier_idx + 1,
+                                    "balance": balance_num,
+                                    "source": "balance",
+                                    "settled_at": now_iso,
+                                    "price": active_price,
+                                }
+                            )
+                            daily_usage = usage
+                            daily_date = fix_key
+                            daily_source = "balance"
+                            daily_settled_at = now_iso
+                            daily_price = active_price
+                            daily_basis = (
+                                f"零用量判定后云端补扣：{fix_key} 余额再降 "
+                                f"{delta:.2f} 元，已按真实用量修正"
+                            )
+                            daily_status = "补扣已修正"
+                            self._prev = {
+                                "balance": balance_num,
+                                "date": today_key,
+                                "sampled_at": now_iso,
+                            }
+                            self._daily = {
+                                "date": today_key,
+                                "usage": daily_usage,
+                                "basis": daily_basis,
+                                "data_date": daily_date,
+                                "source": daily_source,
+                                "settled_at": daily_settled_at,
+                                "price": daily_price,
+                            }
+                        elif now.hour < SETTLEMENT_HOUR:
+                            daily_status = (
+                                f"等待今天 {SETTLEMENT_HOUR:02d}:00 后云端结算昨日用量"
+                            )
+                        elif delta < 0:
+                            daily_status = "本账期已结算，余额上升（可能是缴费），不重复计算"
+                        elif delta == 0:
+                            daily_status = "当前账期已处理，等待下一次云端结算"
+                        else:
+                            daily_status = (
+                                "本账期已结算，余额变动无法归属到具体日期，"
+                                "留待下一账期一并计算"
+                            )
                     else:
-                        delta = round(float(prev_balance) - balance_num, 2)
                         basis_extra = ""
                         skipped = False
+                        end_day = current_settlement - timedelta(days=1)
 
                         if delta < 0:
-                            # 余额变多 = 有缴费。尝试用当月最近一笔缴费冲正。
-                            latest = pays[0] if pays else None
+                            # 余额变多 = 有缴费。按“数据归属日”所在月匹配，
+                            # 否则月末缴费、次月结算必然匹配不到而丢数据。
+                            latest = _pick_payment(pays, end_day, current_settlement)
                             fixed = None
-                            if latest and latest["month"] == this_month:
+                            if latest:
                                 candidate = round(
                                     delta + float(latest["amount"]), 2
                                 )
@@ -208,14 +314,24 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if fixed is not None:
                                 delta = fixed
                                 basis_extra = (
-                                    f"（已冲正缴费 {float(latest['amount']):.2f} 元，为估算）"
+                                    f"（已冲正 {latest['month']} 缴费 "
+                                    f"{float(latest['amount']):.2f} 元，为估算）"
                                 )
+                            elif not payments_ok:
+                                # 缴费接口失败：无法判断是缴费还是异常，
+                                # 保留基准，等接口恢复后再一起冲正
+                                daily_status = (
+                                    "缴费数据暂不可用，余额上升无法判定，"
+                                    "保留基准等待下次刷新"
+                                )
+                                skipped = True
                             else:
-                                # 无法冲正：不伪造用量，但必须重置基准避免明天算负值。
+                                # 确实没有可冲正的缴费：不伪造用量，但必须重置
+                                # 基准，否则下一账期会算出负值。
                                 daily_status = (
                                     f"{prev_settlement} {float(prev_balance):.2f}元 → "
                                     f"{current_settlement} {balance_num:.2f}元："
-                                    "余额上升且无法冲正，本次不计算"
+                                    "余额上升且无缴费记录可冲正，本次不计算"
                                 )
                                 self._prev = {
                                     "balance": balance_num,
@@ -225,34 +341,67 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 skipped = True
 
                         if not skipped:
-                            if delta == 0 and days == 1:
-                                # 云端可能还没出账：保留基准，等余额变化后再补算。
-                                daily_status = "余额与上一账期一致，可能云端尚未出账，等待下次刷新"
-                            elif not active_price:
+                            if (
+                                delta == 0
+                                and not basis_extra
+                                and days == 1
+                                and now.hour < ZERO_CONFIRM_HOUR
+                            ):
+                                daily_status = (
+                                    "余额与上一账期一致，可能云端尚未出账，"
+                                    f"等 {ZERO_CONFIRM_HOUR:02d}:00 后仍无变化再判零用量"
+                                )
+                            elif delta == 0 and not basis_extra and days > 1:
+                                daily_status = (
+                                    f"跨 {days} 个账期余额均未变化，"
+                                    "无法区分零用量与云端未出账，保持等待"
+                                )
+                            elif delta > 0 and not active_price:
                                 daily_status = "气价未知，无法推算日用量"
                             else:
                                 # 当前账期结算的是昨天；跨 N 账期则归属 prev_settlement
                                 # 至 current_settlement-1，绝不把用量记到采样当天。
-                                end_day = current_settlement - timedelta(days=1)
-                                per_cost = round(delta / days, 2)
-                                daily_usage = round(per_cost / active_price, 3)
+                                # 只有“余额原样未动”才算真实零用量；
+                                # 缴费冲正后归零属于估算，不能标成 balance
+                                is_zero = delta == 0 and not basis_extra
+                                if is_zero:
+                                    # 08:00 到 12:00 一直没变化：判定前一天真实零用量。
+                                    # 不补零会一直等待，第二天按两天均摊并覆盖前一天真实值。
+                                    per_cost = 0.0
+                                    daily_usage = 0.0
+                                    daily_source = "balance"
+                                    daily_basis = (
+                                        f"{prev_settlement} 账期余额 "
+                                        f"{float(prev_balance):.2f}元 → "
+                                        f"{current_settlement} 账期余额 "
+                                        f"{balance_num:.2f}元，"
+                                        f"{ZERO_CONFIRM_HOUR:02d}:00 后仍未变化，"
+                                        f"判定 {end_day} 为零用量"
+                                    )
+                                    daily_status = "结算成功（零用量）"
+                                else:
+                                    per_cost = round(delta / days, 2)
+                                    daily_usage = round(per_cost / active_price, 3)
+                                    daily_source = (
+                                        "estimated"
+                                        if days > 1 or basis_extra
+                                        else "balance"
+                                    )
+                                    daily_basis = (
+                                        f"{prev_settlement} 账期余额 "
+                                        f"{float(prev_balance):.2f}元 → "
+                                        f"{current_settlement} 账期余额 "
+                                        f"{balance_num:.2f}元，"
+                                        f"归属 {prev_settlement} 至 {end_day}"
+                                    )
+                                    if days > 1:
+                                        daily_basis += f"，跨 {days} 天均摊"
+                                    daily_basis += basis_extra
+                                    daily_status = "结算成功"
+
                                 daily_date = end_day.isoformat()
-                                daily_source = (
-                                    "estimated"
-                                    if days > 1 or basis_extra
-                                    else "balance"
-                                )
                                 daily_settled_at = now_iso
                                 daily_price = active_price
-                                daily_basis = (
-                                    f"{prev_settlement} 账期余额 {float(prev_balance):.2f}元 → "
-                                    f"{current_settlement} 账期余额 {balance_num:.2f}元，"
-                                    f"归属 {prev_settlement} 至 {end_day}"
-                                )
-                                if days > 1:
-                                    daily_basis += f"，跨 {days} 天均摊"
-                                daily_basis += basis_extra
-                                daily_status = "结算成功"
 
                                 # 同日期先删再插；真实/估算记录会覆盖同日的种子数据。
                                 for i in range(days):
@@ -300,14 +449,21 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             daily_basis = daily_status
 
         # ── 缴费 ─────────────────────────────────────────────
-        pay_total = round(sum(p["amount"] for p in pays), 2)
-        pay_month = round(
-            sum(p["amount"] for p in pays if p["month"] == this_month), 2
-        )
-        latest_pay = pays[0] if pays else None
-        pay_detail = "\n".join(
-            f"{p['month']} {p['amount']:.2f}元 {p['paymentno']}" for p in pays
-        )
+        if payments_ok:
+            pay_total = round(sum(p["amount"] for p in pays), 2)
+            pay_month = round(
+                sum(p["amount"] for p in pays if p["month"] == this_month), 2
+            )
+            latest_pay = pays[0] if pays else None
+            pay_detail = "\n".join(
+                f"{p['month']} {p['amount']:.2f}元 {p['paymentno']}" for p in pays
+            )
+        else:
+            # 接口失败时给未知而不是 0，避免把“查不到”显示成“没有缴费”
+            pay_total = None
+            pay_month = None
+            latest_pay = None
+            pay_detail = "缴费记录接口本次查询失败，稍后自动重试"
 
         # ── 给 electricity-info-card 用的结构 ────────────────
         latest_row = rows[0] if rows else None
@@ -360,7 +516,9 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             None,
         )
-        yesterday_usage = yesterday_row["f_gas"] if yesterday_row else None
+        yesterday_usage = (
+            _to_float(yesterday_row.get("f_gas")) if yesterday_row else None
+        )
         if yesterday_row:
             yesterday_basis = (
                 f"{yesterday_key} 真实余额差结算，"
@@ -431,7 +589,7 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "pay_latest_month": latest_pay["month"] if latest_pay else None,
             "pay_latest_no": latest_pay["paymentno"] if latest_pay else None,
             "pay_month_total": pay_month,
-            "pay_count": len(pays),
+            "pay_count": len(pays) if payments_ok else None,
             "pay_total": pay_total,
             "pay_detail": pay_detail,
             # 卡片
@@ -449,6 +607,31 @@ class GasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "remain_days": remain_days,
             "sync_time": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
+
+
+def _pick_payment(
+    pays: list[dict[str, Any]], end_day: date, settle_day: date | None = None
+) -> dict[str, Any] | None:
+    """挑出可能对应 end_day 账期的缴费。
+
+    缴费接口没有缴费日期，只有 recordmonth，所以按三个可能月份匹配：
+    数据归属日所在月、它的上一个月（月末缴费次月结算），以及结算发生月
+    （结算当天早上刚缴的费）。取其中最新月份的一笔。
+    """
+    if not pays or end_day is None:
+        return None
+    months = {
+        end_day.strftime("%Y%m"),
+        (end_day.replace(day=1) - timedelta(days=1)).strftime("%Y%m"),
+    }
+    if settle_day is not None:
+        months.add(settle_day.strftime("%Y%m"))
+    candidates = [p for p in pays if p.get("month") in months]
+    if not candidates:
+        return None
+    # 优先最新月份；不依赖上层顺序，避免服务端返回乱序时取错金额
+    candidates.sort(key=lambda p: str(p.get("month") or ""), reverse=True)
+    return candidates[0]
 
 
 def _to_float(v: Any) -> float | None:

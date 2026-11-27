@@ -148,6 +148,8 @@ class ZhongranGasApi:
                     )
                 except (TypeError, ValueError):
                     continue
+            # 不依赖服务端顺序：统一按起始气量升序，下游按顺序匹配档位
+            tiers.sort(key=lambda t: t["from"])
             if tiers:
                 price = tiers[0]["price"]
         return {"price": price, "tiers": tiers}
@@ -254,14 +256,14 @@ class ZhongranGasApi:
             "timeStamp": ts,
             "signature": self._simple_sign(self.cust_code, ts),
         }
-        try:
-            j = await self._post_form(URL_PAYMENT_LOG, data)
-        except GasApiError as err:
-            _LOGGER.warning("缴费记录查询失败: %s", err)
-            return []
+        # 缴费失败必须让调用方知道：否则会被当成“没有缴费”，
+        # 进而把余额上升误判为异常并重置余额基准，永久丢掉当天用量
+        j = await self._post_form(URL_PAYMENT_LOG, data)
+        if str(j.get("status")) != "1":
+            raise GasApiError(f"缴费记录查询失败: {j.get('message')}")
 
         rows: list[dict[str, Any]] = []
-        if str(j.get("status")) == "1" and isinstance(j.get("data"), list):
+        if isinstance(j.get("data"), list):
             for x in j["data"]:
                 try:
                     month_raw = str(x.get("recordmonth") or "")
